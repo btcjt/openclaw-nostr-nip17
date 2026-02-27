@@ -221,9 +221,13 @@ export async function startNip17Bus(options: Nip17BusOptions): Promise<Nip17BusH
       const senderPubkey = rumor.pubkey;
       const text = rumor.content;
 
-      // Create reply function
+      // Create reply function — wrapped to prevent unhandled rejections
       const replyFn = async (responseText: string): Promise<void> => {
-        await sendNip17Dm(pool, sk, senderPubkey, responseText, relays, onError);
+        try {
+          await sendNip17Dm(pool, sk, senderPubkey, responseText, relays, onError);
+        } catch (err) {
+          onError?.(err as Error, `reply to ${senderPubkey}`);
+        }
       };
 
       await onMessage(senderPubkey, text, replyFn);
@@ -242,7 +246,7 @@ export async function startNip17Bus(options: Nip17BusOptions): Promise<Nip17BusH
     relays,
     { kinds: [1059], "#p": [pk], since } as any,
     {
-      onevent: handleEvent,
+      onevent: (event) => { handleEvent(event).catch((err) => onError?.(err as Error, `unhandled in handleEvent ${event.id}`)); },
       oneose: () => {
         onEose?.(relays.join(", "));
       },
@@ -298,11 +302,18 @@ async function sendNip17Dm(
   const sealSelf = require('nostr-tools/nip59').createSeal(rumor, sk, pk);
   const wrapForSelf = require('nostr-tools/nip59').createWrap(sealSelf, pk);
 
-  // Publish both wraps to all relays
+  // Publish both wraps to all relays — catch both sync throws and async rejections
   const publishPromises: Promise<any>[] = [];
   for (const wrap of [wrapForRecipient, wrapForSelf]) {
     for (const relay of relays) {
-      publishPromises.push(pool.publish([relay], wrap as any));
+      try {
+        const pubResults = pool.publish([relay], wrap as any);
+        for (const p of pubResults) {
+          if (p && typeof p.catch === 'function') { p.catch(() => {}); publishPromises.push(p); }
+        }
+      } catch (err) {
+        onError?.(err as Error, `publish to ${relay}`);
+      }
     }
   }
 
@@ -310,5 +321,8 @@ async function sendNip17Dm(
   const failures = results.filter(r => r.status === 'rejected');
   if (failures.length > 0) {
     onError?.(new Error(`Publish: ${results.length - failures.length}/${results.length} ok, failures: ${failures.map(f => (f as PromiseRejectedResult).reason).join(', ')}`), 'publish');
+  }
+  if (publishPromises.length === 0) {
+    onError?.(new Error('No publish attempts succeeded (all relays threw synchronously)'), 'publish');
   }
 }
